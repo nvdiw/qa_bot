@@ -3,7 +3,7 @@ Admin Handlers - مدیریت عملیات مدیر
 Handler for admin operations
 """
 
-from typing import Tuple
+from typing import Tuple, Dict
 from utils import CSVLoader
 
 
@@ -37,29 +37,39 @@ def create_admin_menu() -> str:
     ایجاد منوی مدیر
     Create admin menu
     """
-    menu = "<b>🔐 منوی مدیر</b>\n\n"
-    menu += "دستورات موجود:\n"
-    menu += "/stats - نمایش آمار\n"
-    menu += "/reload - بارگذاری دوباره CSV\n"
-    menu += "/list - نمایش تمام سوالات\n\n"
-    menu += "گزینه های دکمه ای:\n"
-    menu += "➕ افزودن سوال - افزودن سوال و جواب جدید\n"
-    menu += "➖ حذف سوال - حذف یک سوال از CSV\n\n"
-    menu += "<i>برای پاسخ دادن به سوال، روی پیام Reply کنید.</i>"
+    menu = "<b>🔐 پنل مدیریت ربات</b>\n\n"
+    menu += "<b>گزینه‌های اصلی:</b>\n"
+    menu += "• آمار ربات\n"
+    menu += "• بارگذاری مجدد داده‌ها\n"
+    menu += "• سوالات بی‌پاسخ\n"
+    menu += "• لیست سوال‌وجواب\n"
+    menu += "• افزودن سوال\n"
+    menu += "• حذف سوال\n\n"
+    menu += "<b>میانبرهای کیبورد:</b>\n"
+    menu += "• 📌 سوالات بی پاسخ\n"
+    menu += "• ➕ افزودن سوال | ➖ حذف سوال\n\n"
+    menu += "<b>نکته:</b>\n"
+    menu += "برای پاسخ به تیکت کاربر، روی همان پیام <i>پاسخ</i> بزنید."
 
     return menu
 
 
-async def get_bot_stats(csv_loader: CSVLoader) -> str:
+async def get_bot_stats(csv_loader: CSVLoader, counters: Dict[str, int]) -> str:
     """
     دریافت آمار ربات
     Get bot statistics
     """
     qa_list = csv_loader.get_all_qa()
     count = len(qa_list)
+    bot_answered = int(counters.get("bot_answered", 0))
+    admin_answered = int(counters.get("admin_answered", 0))
+    unanswered = int(counters.get("unanswered", 0))
 
     stats = "<b>📊 آمار ربات:</b>\n\n"
-    stats += f"📚 تعداد سوالات: {count}\n"
+    stats += f"1) 📚 تعداد سوال و جواب داخل فایل: {count}\n"
+    stats += f"2) 🤖 تعداد سوال‌های پاسخ داده‌شده توسط ربات: {bot_answered}\n"
+    stats += f"3) 👨‍💼 تعداد سوال‌های پاسخ داده‌شده توسط ادمین: {admin_answered}\n"
+    stats += f"4) ❓ تعداد سوال‌های پاسخ داده‌نشده: {unanswered}\n"
 
     return stats
 
