@@ -26,8 +26,11 @@ from telegram.constants import ParseMode
 from config import (
     BOT_TOKEN,
     ADMIN_IDS,
+    OWNER_IDS,
+    ADMIN_DISCOVERY_KEY,
     CSV_FILE,
     BOT_STATS_FILE,
+    ACCESS_CONTROL_FILE,
     CSV_QUESTION_COLUMN,
     CSV_ANSWER_COLUMN,
     SIMILARITY_THRESHOLD,
@@ -35,6 +38,7 @@ from config import (
 )
 from utils import CSVLoader
 from utils.stats_store import BotStatsStore
+from utils.access_control_store import AccessControlStore
 from handlers import handle_user_message, handle_admin_reply
 from handlers.admin_handlers import (
     create_admin_menu,
@@ -58,6 +62,11 @@ csv_loader = CSVLoader(
     similarity_threshold=SIMILARITY_THRESHOLD,
 )
 bot_stats = BotStatsStore(BOT_STATS_FILE)
+access_control = AccessControlStore(
+    file_path=ACCESS_CONTROL_FILE,
+    seed_admin_ids=ADMIN_IDS,
+    seed_owner_ids=OWNER_IDS,
+)
 
 USER_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -78,16 +87,37 @@ ADMIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+OWNER_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["شروع", "راهنما"],
+        ["آمار ربات", "بارگذاری مجدد"],
+        ["سوالات بی‌پاسخ", "لیست سوال‌وجواب"],
+        ["📌 سوالات بی پاسخ"],
+        ["➕ افزودن سوال", "➖ حذف سوال"],
+        ["📋 لیست ادمین‌ها"],
+        ["➕ افزودن ادمین", "➖ حذف ادمین"],
+    ],
+    resize_keyboard=True,
+)
+
 pending_questions: Dict[int, Dict[str, Any]] = {}
 pending_ticket_counter = count(1)
 
 
 def _is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return access_control.is_admin(user_id)
+
+
+def _is_owner(user_id: int) -> bool:
+    return access_control.is_owner(user_id)
 
 
 def _admin_ids() -> list[int]:
-    return sorted(ADMIN_IDS)
+    return access_control.admin_ids(include_owners=True)
+
+
+def _only_admin_ids() -> list[int]:
+    return access_control.admin_ids(include_owners=False)
 
 
 def _build_list_pagination_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup | None:
@@ -184,6 +214,50 @@ def _extract_question(reply_message_text: str) -> str:
     return ""
 
 
+def _current_menu_markup(user_id: int) -> ReplyKeyboardMarkup:
+    if _is_owner(user_id):
+        return OWNER_MENU_KEYBOARD
+    if _is_admin(user_id):
+        return ADMIN_MENU_KEYBOARD
+    return USER_MENU_KEYBOARD
+
+
+def _create_owner_menu() -> str:
+    menu = create_admin_menu()
+    menu += "\n\n<b>👑 امکانات Owner:</b>\n"
+    menu += "• 📋 لیست ادمین‌ها\n"
+    menu += "• ➕ افزودن ادمین (با chat_id/user_id)\n"
+    menu += "• ➖ حذف ادمین (با chat_id/user_id)\n"
+    return menu
+
+
+def _parse_chat_id(text: str) -> int | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _format_admins_list() -> str:
+    rows = access_control.list_admins_with_meta()
+    if not rows:
+        return "❌ هیچ ادمینی ثبت نشده است."
+
+    msg = "<b>📋 لیست ادمین‌ها</b>\n\n"
+    for idx, row in enumerate(rows, start=1):
+        username = f"@{row['username']}" if row.get("username") else "-"
+        first_name = row.get("first_name") or "-"
+        role = "Owner" if row.get("is_owner") else "Admin"
+        msg += f"{idx}) {role}\n"
+        msg += f"chat_id/user_id: <code>{row['id']}</code>\n"
+        msg += f"username: {username}\n"
+        msg += f"name: {first_name}\n\n"
+    return msg
+
+
 async def send_pending_questions_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update.effective_user.id):
         await update.message.reply_text("❌ فقط مدیر می تواند از این دستور استفاده کند.")
@@ -192,7 +266,7 @@ async def send_pending_questions_list(update: Update, context: ContextTypes.DEFA
     if not pending_questions:
         await update.message.reply_text(
             "✅ در حال حاضر سوال بی پاسخی وجود ندارد.",
-            reply_markup=ADMIN_MENU_KEYBOARD,
+            reply_markup=_current_menu_markup(update.effective_user.id),
         )
         return
 
@@ -235,14 +309,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     user = update.effective_user
     is_admin = _is_admin(user.id)
+    is_owner = _is_owner(user.id)
+    if is_admin:
+        access_control.touch_user(user.id, username=user.username, first_name=user.first_name)
     welcome_msg = await handle_start_command(user.id, user.first_name)
     if is_admin:
-        welcome_msg += "\n\n" + create_admin_menu()
+        welcome_msg += "\n\n" + (_create_owner_menu() if is_owner else create_admin_menu())
 
     await update.message.reply_text(
         welcome_msg,
         parse_mode=ParseMode.HTML,
-        reply_markup=ADMIN_MENU_KEYBOARD if is_admin else USER_MENU_KEYBOARD,
+        reply_markup=_current_menu_markup(user.id),
     )
 
 
@@ -254,7 +331,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         help_msg,
         parse_mode=ParseMode.HTML,
-        reply_markup=ADMIN_MENU_KEYBOARD if _is_admin(update.effective_user.id) else USER_MENU_KEYBOARD,
+        reply_markup=_current_menu_markup(update.effective_user.id),
     )
 
 
@@ -266,11 +343,38 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("❌ فقط مدیر می تواند از این دستور استفاده کند.")
         return
 
+    access_control.touch_user(
+        update.effective_user.id,
+        username=update.effective_user.username,
+        first_name=update.effective_user.first_name,
+    )
+
     menu = create_admin_menu()
     await update.message.reply_text(
         menu,
         parse_mode=ParseMode.HTML,
-        reply_markup=ADMIN_MENU_KEYBOARD,
+        reply_markup=_current_menu_markup(update.effective_user.id),
+    )
+
+
+async def owner_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Display owner menu (only for owner)
+    """
+    if not _is_owner(update.effective_user.id):
+        await update.message.reply_text("❌ فقط owner می‌تواند از این دستور استفاده کند.")
+        return
+
+    access_control.touch_user(
+        update.effective_user.id,
+        username=update.effective_user.username,
+        first_name=update.effective_user.first_name,
+    )
+
+    await update.message.reply_text(
+        _create_owner_menu(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=OWNER_MENU_KEYBOARD,
     )
 
 
@@ -286,7 +390,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         stats_msg,
         parse_mode=ParseMode.HTML,
-        reply_markup=ADMIN_MENU_KEYBOARD,
+        reply_markup=_current_menu_markup(update.effective_user.id),
     )
 
 
@@ -305,7 +409,7 @@ async def list_qa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except ValueError:
             await update.message.reply_text(
                 "❌ شماره صفحه نامعتبر است.",
-                reply_markup=ADMIN_MENU_KEYBOARD,
+                reply_markup=_current_menu_markup(update.effective_user.id),
             )
             return
 
@@ -335,7 +439,7 @@ async def reload_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     csv_loader.reload_csv()
     await update.message.reply_text(
         "✅ فایل CSV بارگذاری مجدد شد.",
-        reply_markup=ADMIN_MENU_KEYBOARD,
+        reply_markup=_current_menu_markup(update.effective_user.id),
     )
 
 
@@ -344,6 +448,38 @@ async def pending_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     Show unanswered questions (only for admin)
     """
     await send_pending_questions_list(update, context)
+
+
+async def reveal_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Hidden command:
+    /secureid <ADMIN_DISCOVERY_KEY>
+    """
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("این دستور فقط در چت خصوصی قابل استفاده است.")
+        return
+
+    if not ADMIN_DISCOVERY_KEY:
+        await update.message.reply_text("این قابلیت غیرفعال است.")
+        return
+
+    provided_key = (context.args[0].strip() if context.args else "")
+    if provided_key != ADMIN_DISCOVERY_KEY:
+        await update.message.reply_text("دسترسی مجاز نیست.")
+        return
+
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    username = f"@{user.username}" if user and user.username else "-"
+
+    msg = "🔐 <b>اطلاعات اکانت</b>\n\n"
+    msg += f"chat_id: <code>{chat_id}</code>\n"
+    msg += f"user_id: <code>{user.id}</code>\n"
+    msg += f"username: {username}\n\n"
+    msg += "<b>نمونه برای .env:</b>\n"
+    msg += f"<code>ADMIN_ID={chat_id}</code>\n"
+    msg += f"<code>ADMIN_IDS={chat_id}</code>"
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
 async def handle_list_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -434,7 +570,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             help_msg,
             parse_mode=ParseMode.HTML,
-            reply_markup=ADMIN_MENU_KEYBOARD if _is_admin(user.id) else USER_MENU_KEYBOARD,
+            reply_markup=_current_menu_markup(user.id),
         )
         return
 
@@ -447,7 +583,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         await update.message.reply_text(
             sample_msg,
-            reply_markup=ADMIN_MENU_KEYBOARD if _is_admin(user.id) else USER_MENU_KEYBOARD,
+            reply_markup=_current_menu_markup(user.id),
         )
         return
 
@@ -479,7 +615,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if _is_admin(user.id):
             await update.message.reply_text(
                 "پاسخی با این سوال پیدا نشد.",
-                reply_markup=ADMIN_MENU_KEYBOARD,
+                reply_markup=_current_menu_markup(update.effective_user.id),
             )
             return
 
@@ -501,8 +637,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             question=question,
         )
 
-        # Send to all admins
-        for admin_id in _admin_ids():
+        # Send only to real admins (not owners)
+        for admin_id in _only_admin_ids():
             sent = await context.bot.send_message(
                 chat_id=admin_id,
                 text=admin_msg,
@@ -524,14 +660,17 @@ async def handle_admin_message_reply(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """
-    Handle admin's reply to unanswered questions
+    Handle admin/owner messages and workflows.
     """
-    if not _is_admin(update.effective_user.id):
+    user = update.effective_user
+    if not _is_admin(user.id):
         return
 
+    access_control.touch_user(user.id, username=user.username, first_name=user.first_name)
     reply_text = (update.message.text or "").strip()
     original_msg = update.message.reply_to_message.text if update.message.reply_to_message else ""
     admin_action = context.user_data.get("admin_action")
+    owner_action = context.user_data.get("owner_action")
 
     if reply_text in {"شروع", "/start"}:
         await start(update, context)
@@ -539,6 +678,10 @@ async def handle_admin_message_reply(
 
     if reply_text in {"راهنما", "/help"}:
         await help_command(update, context)
+        return
+
+    if reply_text in {"👑 منوی Owner", "/owner"}:
+        await owner_menu(update, context)
         return
 
     if reply_text in {"آمار ربات", "/stats"}:
@@ -567,32 +710,129 @@ async def handle_admin_message_reply(
         )
         return
 
-    # Start add flow
+    if _is_owner(user.id) and reply_text in {"📋 لیست ادمین‌ها", "لیست ادمین ها", "لیست ادمین‌ها"}:
+        await update.message.reply_text(
+            _format_admins_list(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_current_menu_markup(user.id),
+        )
+        return
+
+    if _is_owner(user.id) and reply_text in {"➕ افزودن ادمین", "افزودن ادمین"}:
+        context.user_data["owner_action"] = "await_add_admin_id"
+        await update.message.reply_text(
+            "chat_id یا user_id ادمین جدید را ارسال کنید.\n\n"
+            "در صورتی که شناسه در دسترس نیست، از کاربر بخواهید دستور زیر را برای ربات ارسال کند:\n"
+            f"/secureid {ADMIN_DISCOVERY_KEY}\n\n"
+            "سپس کاربر، chat_id نمایش‌داده‌شده را برای شما ارسال کند تا دسترسی ادمین برای ایشان ثبت شود.",
+            reply_markup=_current_menu_markup(user.id),
+        )
+        return
+
+    if _is_owner(user.id) and reply_text in {"➖ حذف ادمین", "حذف ادمین"}:
+        context.user_data["owner_action"] = "await_remove_admin_id"
+        await update.message.reply_text(
+            "chat_id یا user_id ادمینی که باید حذف شود را بفرستید.",
+            reply_markup=_current_menu_markup(user.id),
+        )
+        return
+
+    if _is_owner(user.id) and owner_action == "await_add_admin_id":
+        new_admin_id = _parse_chat_id(reply_text)
+        if new_admin_id is None:
+            await update.message.reply_text(
+                "❌ شناسه نامعتبر است. فقط عدد بفرستید.",
+                reply_markup=_current_menu_markup(user.id),
+            )
+            return
+
+        fetched_username = None
+        fetched_first_name = None
+        try:
+            chat = await context.bot.get_chat(new_admin_id)
+            fetched_username = chat.username
+            fetched_first_name = chat.first_name
+        except Exception:
+            pass
+
+        added = access_control.add_admin(
+            user_id=new_admin_id,
+            username=fetched_username,
+            first_name=fetched_first_name,
+            added_by=user.id,
+        )
+        context.user_data.pop("owner_action", None)
+
+        if added:
+            await update.message.reply_text(
+                f"✅ ادمین جدید اضافه شد: <code>{new_admin_id}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_current_menu_markup(user.id),
+            )
+        else:
+            await update.message.reply_text(
+                f"ℹ️ این شناسه از قبل ادمین است: <code>{new_admin_id}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_current_menu_markup(user.id),
+            )
+        return
+
+    if _is_owner(user.id) and owner_action == "await_remove_admin_id":
+        remove_admin_id = _parse_chat_id(reply_text)
+        if remove_admin_id is None:
+            await update.message.reply_text(
+                "❌ شناسه نامعتبر است. فقط عدد بفرستید.",
+                reply_markup=_current_menu_markup(user.id),
+            )
+            return
+
+        if _is_owner(remove_admin_id):
+            context.user_data.pop("owner_action", None)
+            await update.message.reply_text(
+                "❌ این شناسه Owner است و حذف نمی‌شود.",
+                reply_markup=_current_menu_markup(user.id),
+            )
+            return
+
+        removed = access_control.remove_admin(remove_admin_id)
+        context.user_data.pop("owner_action", None)
+        if removed:
+            await update.message.reply_text(
+                f"✅ ادمین حذف شد: <code>{remove_admin_id}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_current_menu_markup(user.id),
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ ادمینی با این شناسه پیدا نشد: <code>{remove_admin_id}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_current_menu_markup(user.id),
+            )
+        return
+
     if reply_text in {"➕ افزودن سوال", "افزودن سوال"}:
         context.user_data["admin_action"] = "await_add_question"
         context.user_data.pop("pending_question", None)
         await update.message.reply_text(
             "لطفا متن سوال جدید را ارسال کنید.",
-            reply_markup=ADMIN_MENU_KEYBOARD,
+            reply_markup=_current_menu_markup(user.id),
         )
         return
 
-    # Start delete flow
     if reply_text in {"➖ حذف سوال", "حذف سوال"}:
         context.user_data["admin_action"] = "await_delete_question"
         await update.message.reply_text(
             "لطفا متن دقیق سوالی که باید حذف شود را ارسال کنید.",
-            reply_markup=ADMIN_MENU_KEYBOARD,
+            reply_markup=_current_menu_markup(user.id),
         )
         return
 
-    # Continue add flow
     if admin_action == "await_add_question":
         context.user_data["pending_question"] = reply_text
         context.user_data["admin_action"] = "await_add_answer"
         await update.message.reply_text(
             "سوال ثبت شد. حالا لطفا جواب این سوال را ارسال کنید.",
-            reply_markup=ADMIN_MENU_KEYBOARD,
+            reply_markup=_current_menu_markup(user.id),
         )
         return
 
@@ -601,47 +841,44 @@ async def handle_admin_message_reply(
         if not pending_question:
             context.user_data.pop("admin_action", None)
             await update.message.reply_text(
-                "❌ سوال پیدا نشد. دوباره از «➕ افزودن سوال» شروع کنید.",
-                reply_markup=ADMIN_MENU_KEYBOARD,
+                "❌ سوال پیدا نشد. دوباره از \xab➕ افزودن سوال\xbb شروع کنید.",
+                reply_markup=_current_menu_markup(user.id),
             )
             return
 
         if csv_loader.add_qa(pending_question, reply_text):
             await update.message.reply_text(
                 "✅ سوال و جواب جدید با موفقیت اضافه شد.",
-                reply_markup=ADMIN_MENU_KEYBOARD,
+                reply_markup=_current_menu_markup(user.id),
             )
         else:
             await update.message.reply_text(
                 "❌ خطا در ذخیره سوال و جواب.",
-                reply_markup=ADMIN_MENU_KEYBOARD,
+                reply_markup=_current_menu_markup(user.id),
             )
 
         context.user_data.pop("admin_action", None)
         context.user_data.pop("pending_question", None)
         return
 
-    # Continue delete flow
     if admin_action == "await_delete_question":
         if csv_loader.remove_qa(reply_text):
             await update.message.reply_text(
                 "✅ سوال موردنظر حذف شد.",
-                reply_markup=ADMIN_MENU_KEYBOARD,
+                reply_markup=_current_menu_markup(user.id),
             )
         else:
             await update.message.reply_text(
                 "❌ سوالی با این متن پیدا نشد.",
-                reply_markup=ADMIN_MENU_KEYBOARD,
+                reply_markup=_current_menu_markup(user.id),
             )
         context.user_data.pop("admin_action", None)
         return
 
-    # If this is not a reply and no admin workflow is active, treat admin like a normal user question.
     if not update.message.reply_to_message:
         await handle_message(update, context)
         return
 
-    # Extract ticket data from the original message
     try:
         ticket_id = _extract_ticket_id(original_msg)
         ticket = None
@@ -650,25 +887,32 @@ async def handle_admin_message_reply(
             if not ticket:
                 await update.message.reply_text(
                     "❌ این تیکت پیدا نشد یا قبلا پاسخ داده شده است.",
-                    reply_markup=ADMIN_MENU_KEYBOARD,
+                    reply_markup=_current_menu_markup(user.id),
                 )
                 return
+            if _is_owner(user.id):
+                owner_ticket_message_ids = ticket.get("admin_message_ids", {}).get(user.id, [])
+                reply_message_id = update.message.reply_to_message.message_id if update.message.reply_to_message else None
+                if reply_message_id not in owner_ticket_message_ids:
+                    await update.message.reply_text(
+                        "❌ برای پاسخ‌دادن، اول از منوی Owner گزینه «سوالات بی‌پاسخ» را باز کنید و روی همان پیام ریپلای بزنید.",
+                        reply_markup=_current_menu_markup(user.id),
+                    )
+                    return
             user_id = ticket["user_id"]
             question = ticket["question"]
         else:
-            # Fallback for older forwarded messages without Ticket.
             user_id = _extract_user_id(original_msg)
             question = _extract_question(original_msg)
             if user_id is None:
                 await update.message.reply_text(
-                    "❌ این پیام قابل شناسایی نیست. لطفا روی پیام سوال کاربر ریپلای کنید.",
-                    reply_markup=ADMIN_MENU_KEYBOARD,
+                    "❌ این پیام قابل شناسایی نیست. روی پیام سوال کاربر ریپلای کنید.",
+                    reply_markup=_current_menu_markup(user.id),
                 )
                 return
 
         logger.info(f"Admin reply: User {user_id}, Answer: {reply_text}")
 
-        # Add to database
         success, msg = await handle_admin_reply(
             reply_text=reply_text,
             original_question=question,
@@ -676,11 +920,9 @@ async def handle_admin_message_reply(
             csv_loader=csv_loader,
         )
 
-        # Notify admin
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
-        # Send answer to user
-        user_response = f"📌 <b>جواب شما:</b>\n{reply_text}"
+        user_response = f"📌 <b>جواب شما:</b>\\n{reply_text}"
         await context.bot.send_message(
             chat_id=user_id,
             text=user_response,
@@ -692,7 +934,7 @@ async def handle_admin_message_reply(
                 await _delete_ticket_messages_from_other_admins(
                     context=context,
                     ticket=ticket,
-                    answered_admin_id=update.effective_user.id,
+                    answered_admin_id=user.id,
                 )
             if success:
                 bot_stats.increment_admin_answered()
@@ -700,16 +942,16 @@ async def handle_admin_message_reply(
             pending_questions.pop(ticket_id, None)
             await update.message.reply_text(
                 f"✅ تیکت {ticket_id} از لیست سوالات بی پاسخ خارج شد.",
-                reply_markup=ADMIN_MENU_KEYBOARD,
+                reply_markup=_current_menu_markup(user.id),
             )
 
-            if len(_admin_ids()) > 1:
-                for admin_id in _admin_ids():
-                    if admin_id == update.effective_user.id:
+            if len(_only_admin_ids()) > 1:
+                for admin_id in _only_admin_ids():
+                    if admin_id == user.id:
                         continue
                     await context.bot.send_message(
                         chat_id=admin_id,
-                        text=f"✅ تیکت {ticket_id} توسط ادمین {update.effective_user.id} پاسخ داده شد و بسته شد.",
+                        text=f"✅ تیکت {ticket_id} توسط ادمین {user.id} پاسخ داده شد و بسته شد.",
                     )
 
         logger.info(f"Answer sent to user {user_id}")
@@ -717,6 +959,13 @@ async def handle_admin_message_reply(
     except Exception as e:
         logger.error(f"Error handling admin reply: {e}")
         await update.message.reply_text(f"❌ خطا: {str(e)}")
+
+
+async def route_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _is_admin(update.effective_user.id):
+        await handle_admin_message_reply(update, context)
+        return
+    await handle_message(update, context)
 
 
 # ==================== Main Application ====================
@@ -729,8 +978,8 @@ def main() -> None:
         logger.error("❌ BOT_TOKEN مشخص نشده! لطفا فایل .env را بررسی کنید.")
         return
 
-    if not ADMIN_IDS:
-        logger.error("❌ ADMIN_ID/ADMIN_IDS مشخص نشده! لطفا فایل .env را بررسی کنید.")
+    if not _admin_ids():
+        logger.error("❌ هیچ admin/owner فعالی پیدا نشد! ADMIN_IDS یا OWNER_IDS را بررسی کنید.")
         return
 
     logger.info("🤖 شروع ربات QABot...")
@@ -742,25 +991,19 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("admin", admin_menu))
+    application.add_handler(CommandHandler("owner", owner_menu))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("list", list_qa))
     application.add_handler(CommandHandler("reload", reload_csv))
     application.add_handler(CommandHandler("pending", pending_list))
+    application.add_handler(CommandHandler("secureid", reveal_chat_id))
     application.add_handler(CallbackQueryHandler(handle_list_pagination, pattern=r"^(list|pending):\d+$"))
 
-    # Handle admin replies
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.User(user_id=_admin_ids()),
-            handle_admin_message_reply,
-        )
-    )
-
-    # Handle user messages
+    # Handle all text messages (dynamic routing by role)
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            handle_message,
+            route_text_message,
         )
     )
 
