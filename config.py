@@ -13,6 +13,7 @@ load_dotenv()
 # Bot Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_ID = int(os.getenv('ADMIN_ID', 0))
+ADMIN_DISCOVERY_KEY = os.getenv('ADMIN_DISCOVERY_KEY', '').strip()
 
 
 def _parse_admin_ids() -> set[int]:
@@ -34,11 +35,29 @@ def _parse_admin_ids() -> set[int]:
 
 ADMIN_IDS = _parse_admin_ids()
 
+
+def _parse_owner_ids() -> set[int]:
+    raw = os.getenv('OWNER_IDS', '')
+    parsed: set[int] = set()
+    for item in raw.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            parsed.add(int(item))
+        except ValueError:
+            continue
+    return parsed
+
+
+OWNER_IDS = _parse_owner_ids()
+
 # File paths
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / 'data'
 CSV_FILE = DATA_DIR / 'qa_data.csv'
 BOT_STATS_FILE = DATA_DIR / 'bot_stats.json'
+ACCESS_CONTROL_FILE = DATA_DIR / 'access_control.json'
 
 # CSV Configuration
 CSV_QUESTION_COLUMN = 'سوال'  # Change if your CSV has different column name
