@@ -1,5 +1,10 @@
 {
-  "bot_answered": 0,
+  "bot_answered": 3,
   "admin_answered": 0,
-  "unanswered": 0
+  "unanswered": 0,
+  "feedback_helpful": 1,
+  "feedback_unhelpful": 0,
+  "resolved_tickets": 0,
+  "total_response_seconds": 0.0,
+  "unanswered_questions": {}
 }

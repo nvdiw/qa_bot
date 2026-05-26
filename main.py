@@ -10,6 +10,8 @@ Automated Q&A Telegram Bot
 
 import logging
 import re
+import time
+from collections import Counter
 from itertools import count
 from typing import Dict, Any
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
@@ -70,15 +72,15 @@ access_control = AccessControlStore(
 
 USER_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
+        ["❓ سوال بپرس", "نمونه سوال"],
         ["شروع", "راهنما"],
-        ["نمونه سوال"],
     ],
     resize_keyboard=True,
 )
 
 ADMIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["شروع", "راهنما"],
+        ["❓ سوال بپرس", "راهنما"],
         ["آمار ربات", "بارگذاری مجدد"],
         ["سوالات بی‌پاسخ", "لیست سوال‌وجواب"],
         ["📌 سوالات بی پاسخ"],
@@ -89,7 +91,7 @@ ADMIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 OWNER_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["شروع", "راهنما"],
+        ["❓ سوال بپرس", "راهنما"],
         ["آمار ربات", "بارگذاری مجدد"],
         ["سوالات بی‌پاسخ", "لیست سوال‌وجواب"],
         ["📌 سوالات بی پاسخ"],
@@ -102,6 +104,13 @@ OWNER_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 pending_questions: Dict[int, Dict[str, Any]] = {}
 pending_ticket_counter = count(1)
+
+FEEDBACK_KEYBOARD = InlineKeyboardMarkup(
+    [[
+        InlineKeyboardButton("👍 مفید بود", callback_data="fb:up"),
+        InlineKeyboardButton("👎 مفید نبود", callback_data="fb:down"),
+    ]]
+)
 
 
 def _is_admin(user_id: int) -> bool:
@@ -118,6 +127,24 @@ def _admin_ids() -> list[int]:
 
 def _only_admin_ids() -> list[int]:
     return access_control.admin_ids(include_owners=False)
+
+
+def _normalize_question(question: str) -> str:
+    return re.sub(r"\s+", " ", (question or "").strip().lower())
+
+
+def _sorted_pending_ticket_ids() -> list[int]:
+    if not pending_questions:
+        return []
+    freq = Counter(_normalize_question(item.get("question", "")) for item in pending_questions.values())
+    return sorted(
+        pending_questions.keys(),
+        key=lambda tid: (
+            -freq[_normalize_question(pending_questions[tid].get("question", ""))],
+            float(pending_questions[tid].get("created_at", 0)),
+            tid,
+        ),
+    )
 
 
 def _build_list_pagination_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup | None:
@@ -272,7 +299,7 @@ async def send_pending_questions_list(update: Update, context: ContextTypes.DEFA
 
     page = 1
     page_size = 5
-    ticket_ids = sorted(pending_questions.keys())
+    ticket_ids = _sorted_pending_ticket_ids()
     total = len(ticket_ids)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page_ids = ticket_ids[(page - 1) * page_size: page * page_size]
@@ -520,7 +547,7 @@ async def handle_list_pagination(update: Update, context: ContextTypes.DEFAULT_T
 
     # pending pagination
     page_size = 5
-    ticket_ids = sorted(pending_questions.keys())
+    ticket_ids = _sorted_pending_ticket_ids()
     total = len(ticket_ids)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = max(1, min(page, total_pages))
@@ -552,12 +579,31 @@ async def handle_list_pagination(update: Update, context: ContextTypes.DEFAULT_T
         _track_ticket_message(ticket_id, user_id, sent.message_id)
 
 
+async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+
+    data = query.data or ""
+    if data == "fb:up":
+        bot_stats.increment_feedback_helpful()
+        await query.answer("مرسی از بازخورد مثبت شما 🙏")
+    elif data == "fb:down":
+        bot_stats.increment_feedback_unhelpful()
+        await query.answer("بازخورد شما ثبت شد. ممنون 🙏")
+    else:
+        return
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
 # ==================== Message Handlers ====================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle user messages
-    """
+    """Handle user messages."""
     user = update.effective_user
     question = (update.message.text or "").strip()
 
@@ -574,12 +620,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    if question == "❓ سوال بپرس":
+        await update.message.reply_text(
+            "سوال خود را واضح و کوتاه بفرستید تا سریع‌تر پاسخ دقیق دریافت کنید.",
+            reply_markup=_current_menu_markup(user.id),
+        )
+        return
+
     if question == "نمونه سوال":
         sample_msg = (
-            "چند نمونه خوب برای تست:\n\n"
-            "• قیمت اشتراک چقدره؟\n"
-            "• ساعات کاری شما چیه؟\n"
-            "• سلام، لطفا قیمت و نحوه ثبت‌نام رو می‌گید؟"
+            "چند نمونه خوب برای تست:\\n\\n"
+            "• قیمت اشتراک چقدره؟\\n"
+            "• ساعات کاری شما چیه؟\\n"
+            "• لطفا قیمت و نحوه ثبت‌نام رو می‌گید؟"
         )
         await update.message.reply_text(
             sample_msg,
@@ -589,10 +642,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info(f"Message from {user.id} ({user.first_name}): {question}")
 
-    # Show typing indicator
     await update.message.chat.send_action("typing")
 
-    # Handle user message
     response, is_answered = await handle_user_message(
         question=question,
         user_id=user.id,
@@ -603,57 +654,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if is_answered:
         bot_stats.increment_bot_answered()
-        # Send answer to user
         await update.message.reply_text(
             response,
             parse_mode=ParseMode.HTML,
+            reply_markup=FEEDBACK_KEYBOARD,
         )
         logger.info(f"Answer sent to user {user.id}")
+        return
 
-    else:
-        # Do not forward admin's own unmatched questions back to admin queue.
-        if _is_admin(user.id):
-            await update.message.reply_text(
-                "پاسخی با این سوال پیدا نشد.",
-                reply_markup=_current_menu_markup(update.effective_user.id),
-            )
-            return
-
-        ticket_id = next(pending_ticket_counter)
-        pending_questions[ticket_id] = {
-            "user_id": user.id,
-            "username": user.username,
-            "first_name": user.first_name,
-            "question": question,
-            "admin_message_ids": {},
-        }
-        bot_stats.increment_unanswered()
-
-        admin_msg = _build_pending_message(
-            ticket_id=ticket_id,
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            question=question,
-        )
-
-        # Send only to real admins (not owners)
-        for admin_id in _only_admin_ids():
-            sent = await context.bot.send_message(
-                chat_id=admin_id,
-                text=admin_msg,
-                parse_mode=ParseMode.HTML,
-                reply_markup=None,
-            )
-            _track_ticket_message(ticket_id, admin_id, sent.message_id)
-
-        # Inform user
+    if _is_admin(user.id):
         await update.message.reply_text(
-            NOT_FOUND_MESSAGE,
-            parse_mode=ParseMode.HTML,
+            "پاسخی با این سوال پیدا نشد.",
+            reply_markup=_current_menu_markup(update.effective_user.id),
         )
+        return
 
-        logger.info(f"Unanswered question queued as ticket {ticket_id} for user {user.id}")
+    ticket_id = next(pending_ticket_counter)
+    pending_questions[ticket_id] = {
+        "user_id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "question": question,
+        "created_at": time.time(),
+        "admin_message_ids": {},
+    }
+    bot_stats.increment_unanswered(question=question)
+
+    admin_msg = _build_pending_message(
+        ticket_id=ticket_id,
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        question=question,
+    )
+
+    for admin_id in _only_admin_ids():
+        sent = await context.bot.send_message(
+            chat_id=admin_id,
+            text=admin_msg,
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+        _track_ticket_message(ticket_id, admin_id, sent.message_id)
+
+    await update.message.reply_text(
+        NOT_FOUND_MESSAGE,
+        parse_mode=ParseMode.HTML,
+    )
+
+    logger.info(f"Unanswered question queued as ticket {ticket_id} for user {user.id}")
 
 
 async def handle_admin_message_reply(
@@ -927,6 +976,7 @@ async def handle_admin_message_reply(
             chat_id=user_id,
             text=user_response,
             parse_mode=ParseMode.HTML,
+            reply_markup=FEEDBACK_KEYBOARD,
         )
 
         if ticket_id is not None:
@@ -939,6 +989,9 @@ async def handle_admin_message_reply(
             if success:
                 bot_stats.increment_admin_answered()
                 bot_stats.decrement_unanswered()
+                if ticket:
+                    elapsed = time.time() - float(ticket.get("created_at", time.time()))
+                    bot_stats.record_ticket_resolution(elapsed)
             pending_questions.pop(ticket_id, None)
             await update.message.reply_text(
                 f"✅ تیکت {ticket_id} از لیست سوالات بی پاسخ خارج شد.",
@@ -998,6 +1051,7 @@ def main() -> None:
     application.add_handler(CommandHandler("pending", pending_list))
     application.add_handler(CommandHandler("secureid", reveal_chat_id))
     application.add_handler(CallbackQueryHandler(handle_list_pagination, pattern=r"^(list|pending):\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_feedback_callback, pattern=r"^fb:(up|down)$"))
 
     # Handle all text messages (dynamic routing by role)
     application.add_handler(
